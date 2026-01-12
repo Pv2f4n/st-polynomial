@@ -1,6 +1,11 @@
 from sage.all import Matrix, ZZ, LaurentPolynomialRing
-import spherogram as sph
+from sage.graphs.graph import Graph
+from sage.rings.polynomial.laurent_polynomial_mpair import LaurentPolynomial_mpair as LaurentPoly
+from sage.rings.integer import Integer
+from spherogram.links.invariants import Link
+from spherogram.links.links_base import CrossingStrand
 import heapq
+from collections import defaultdict
 
 def _build_strand_to_region(faces):
     """
@@ -63,7 +68,7 @@ def _choose_unbounded_region(faces):
     lengths = [len(face) for face in faces]
     return max(range(len(faces)), key=lambda i: lengths[i])
 
-def alexander_region_matrix_2var(L, *, unbounded_region_index=None, flip_incoming_rule=False, debug=False, show_matrix = False):
+def alexander_region_matrix_2var(L, *, unbounded_region_index=None, flip_incoming_rule=False, debug=False, show_matrix = False, in_out = False):
     """
     Alexander's 1928 region-crossing matrix over ZZ[s^{±1}, t^{±1}] with checkerboard rule.
 
@@ -125,12 +130,23 @@ def alexander_region_matrix_2var(L, *, unbounded_region_index=None, flip_incomin
         Given base_t ∈ {t, -t, 1, -1}, return the coefficient after applying the s/t swap rule.
         Only ±t are swapped to ±s; 1 and -1 remain unchanged.
         """
-        if base_t not in (t, -t):
-            return base_t
         same_color = (colors[region_idx] == colors[unbounded_region_index])
-        if same_color:
+        if same_color and in_out:
+            if base_t == 1:
+                return t
+            elif base_t == -1:
+                return -t
+            elif base_t == t:
+                return 1
+            else:
+                return -1
+        elif same_color and not in_out:
             return base_t
-        return s if base_t == t else -s
+        else:
+            if base_t in [-1, 1]:
+                return base_t
+            else:
+                return s if base_t == t else -s
 
     # Build the matrix
     M = Matrix(R, n, m, 0)
@@ -243,8 +259,6 @@ def determinants_for_pairs(M, pairs, *, check_shape=True):
     for (i, j) in pairs:
         out[(i, j)] = det_minor_delete_columns(M, (i, j), check_shape=check_shape)
     return out
-
-from sage.all import ZZ
 
 def _exp_coeff_dict(f):
     """
@@ -371,145 +385,111 @@ def normalize_laurent(f):
 
     return f
 
-def st(link, show_matrix = False):
-    M, regions, colors, ub_idx = alexander_region_matrix_2var(link, debug=False, show_matrix)
+def st(link, show_matrix = False, in_out = False):
+    M, regions, colors, ub_idx = alexander_region_matrix_2var(link, debug=False, show_matrix = show_matrix, in_out = in_out)
 
     pairs = adjacent_region_column_pairs(link)
-    d = det_minor_delete_columns(M, pairs[0])
+    d = det_minor_delete_columns(M, pairs[1])
     n = normalize_laurent(d)
     return n
 
-# Rewrite documentation using reST for proper HTML formatting later
+R = LaurentPolynomialRing(ZZ, ('s', 't'))
+s, t = R.gens()
 
-def tait_graphs(L):
-    """
-    Returns a pair (primal_graph, dual_graph) where primal_graph is the primal Tait graph of the link L and dual_graph is its planar dual. The primal graph corresponds to the regions whose colors are 0, or equivalently, whose variable entries in the st-matrix of L are +-t. Edges are of the form (v_1, v_2, label) where the label is a 2-element tuple, the first element of which is the crossing index and the second element of which is a boolean that is True if the edge points from the smaller region to larger region and False otherwise. This second label is necessary because the ordering of endpoint vertices is erased when the graph is created and automatically put in increasing order. 
+def tait_graphs(L : Link) -> tuple[Graph, Graph]:
+    """Returns the primal and dual Tait graphs of a link.
+
+    The primal graph is chosen to be the one containing the vertex of the region touching the most strands, or equivalently the one whose variable entries in the st-matrix of L are +-t. Edges are labeled by a 3-tuple containing the index of the associated crossing, the crossing variable of the region of lower index, and the crossing variable of the region of higher index. 
+
+    The Tait graphs are represented as undirected graphs for the purposes of using the Sage spanning tree iterator and when counting in-away edges of trees. The direction of the edge can be recovered from the label as pointing to the region whose variable is +-1.
     """
     M, _, _, _ = alexander_region_matrix_2var(L)
-    nr, nc = M.nrows(), M.ncols()
+    crossings, regions = M.nrows(), M.ncols()
     primal_edges, dual_edges = [], []
-    R = LaurentPolynomialRing(ZZ, ('s', 't'))
-    s, t = R.gens()
-    # Iterate through crossings, adding both primal and dual edge, labeled by crossing
-    for i in range(nr):
+    # Iterate through crossings, adding both primal and dual edge
+    for crossing in range(crossings):
+        # Using second element in pair, tracks if region appears around crossing
         match_regions = [[1, -1], [-1, -1], [s, -1], [-s, -1], [t, -1], [-t, -1]]
-        for j in range(nc):
+        for region in range(regions):
             for k in range(6):
-                if M[i][j] == match_regions[k][0]:
-                    match_regions[k][1] = j
+                if M[crossing][region] == match_regions[k][0]:
+                    match_regions[k][1] = region
+        # Labels are either t, -s, 1, -1...
         if match_regions[4][1] != -1:
-            primal_edges.append((match_regions[4][1], match_regions[0][1], (i, match_regions[4][1] < match_regions[0][1])))
-            dual_edges.append((match_regions[3][1], match_regions[1][1], (i, match_regions[3][1] < match_regions[1][1])))
+            # Sage automatically sorts edge endpoints in increasing order during creation, which is why we need to preemptively sort the crossing variables accordingly
+            primal_edges.append((match_regions[4][1], match_regions[0][1], (crossing, t, 1) if match_regions[4][1] < match_regions[0][1] else (crossing, 1, t)))
+            dual_edges.append((match_regions[3][1], match_regions[1][1], (crossing, -s, -1) if match_regions[3][1] < match_regions[1][1] else (crossing, -1, -s)))
+        # or -t, s, 1, -1
         else:
-            primal_edges.append((match_regions[5][1], match_regions[1][1], (i, match_regions[5][1] < match_regions[1][1])))
-            dual_edges.append((match_regions[2][1], match_regions[0][1], (i, match_regions[2][1] < match_regions[0][1])))
-    primal_graph = Graph(primal_edges, multiedges = True)
-    dual_graph = Graph(dual_edges, multiedges = True)
+            primal_edges.append((match_regions[5][1], match_regions[1][1], (crossing, -t, -1) if match_regions[5][1] < match_regions[1][1] else (crossing, -1, -t)))
+            dual_edges.append((match_regions[2][1], match_regions[0][1], (crossing, s, 1) if match_regions[2][1] < match_regions[0][1] else (crossing, 1, s)))
+    primal_graph = Graph(primal_edges, multiedges = True, loops = True)
+    dual_graph = Graph(dual_edges, multiedges = True, loops = True)
     return primal_graph, dual_graph
 
-def _make_adjacency_list(primal_graph, dual_graph):
-    """
-    Returns adjacency list representing both the primal graph primal_graph and its dual dual_graph outputted by tait_graphs. This is possible in a single adjacency list because the vertices/regions of primal_graph and dual_graph are complements. Each entry of the adjacency list is a list of 3-element tuples, where the first element is the neighboring vertex, the second element is the crossing index, and the third element is a boolean which is True if the edge is being traversed forwards and False otherwise.
-    """
-    adj_list = [[] for i in range(len(primal_graph.vertices()) + len(dual_graph.vertices()))]
-    for (v_1, v_2, (crossing, small_to_large)) in primal_graph.edges() + dual_graph.edges():
-        if small_to_large:
-            # Track the crossing here as well just so _get_oriented_edges below can return the actual list of edges 
-            adj_list[v_1].append((v_2, crossing, True))
-            adj_list[v_2].append((v_1, crossing, False))
-        else:
-            adj_list[v_1].append((v_2, crossing, False))
-            adj_list[v_2].append((v_1, crossing, True))
-    return adj_list
+def _st_term(sp_tree : Graph, root : int, outward : bool = False) -> LaurentPoly:
+    """Returns the st-term resulting from a rooted spanning tree.
 
-# Need both Sage graphs and adjacency list above because spanning trees method requires using Sage graphs, but the method only
-# applies to undirected graphs, so we need some other way to track directions
-
-def _get_oriented_edges(sp_tree, root, adj_list, outward = False):
+    Args:
+        sp_tree: A spanning tree of a Tait graph outputted from the tait_graphs function. 
+        root: The region/vertex the tree is declared to be rooted at.
+        outward: False to count the number of edges pointed into the root, and True to count the number of edges pointed away.
     """
-    Returns a list of the edges in a spanning tree sp_tree of the directed graph represented by adj_list that are oriented towards root if outward is False and away from root if outward is True.
-    """
-    # Perform BFS on the adjacency list of the dual graphs, exploring edges only if they appear in sp_tree
-    edges_in_sp_tree = set(sp_tree.edges())
-    discovered = [False for i in range(len(adj_list))]
-    oriented_edges = []
+    discovered = {root}
+    st_term = 1
     heap = []
-    discovered[root] = True
     heapq.heappush(heap, root)
     while len(heap) > 0:
         cur = heapq.heappop(heap)
-        for (neighbor, crossing, forward) in adj_list[cur]:
-            edge = _adj_entry_to_edge(cur, neighbor, crossing, forward)
-            if not discovered[neighbor] and edge in edges_in_sp_tree:
-                discovered[neighbor] = True
-                heapq.heappush(heap, neighbor)
-                if forward and outward:
-                    oriented_edges.append(edge)
-                elif not forward and not outward:
-                    oriented_edges.append(edge)
-    return oriented_edges
+        for (region1, region2, (crossing, var1, var2)) in sp_tree.edges_incident(cur):
+            if cur == region1 and region2 not in discovered:
+                discovered.add(region2)
+                heapq.heappush(heap, region2)
+                if outward:
+                    st_term *= var1
+                else:
+                    st_term *= var2
+            elif cur == region2 and region1 not in discovered:
+                discovered.add(region1)
+                heapq.heappush(heap, region1)
+                if outward:
+                    st_term *= var2
+                else:
+                    st_term *= var1
+    return st_term
 
-def _adj_entry_to_edge(cur, neighbor, crossing, forward):
-    """
-    Returns the edge between cur and neighbor over crossing, where forward is True if the edge points from cur to neighbor and False otherwise.
-    """
-    small_to_large = True if (cur < neighbor and forward) or (cur > neighbor and not forward) else False
-    return (cur, neighbor, (crossing, small_to_large)) if cur < neighbor else (neighbor, cur, (crossing, small_to_large))
+def _dual_tree(sp_tree : Graph, dual_graph : Graph) -> Graph:
+    """Returns the dual tree of a spanning tree on a Tait graph.
 
-def _get_dual_tree(sp_tree, dual_graph):
-    """
-    Returns the dual of sp_tree in the dual graph dual_graph.
+    The dual tree of a spanning tree on a Tait graph consists of the edges in the dual Tait graph that go through the link diagram crossings not touched by the original spanning tree. It is a spanning tree of the dual Tait graph. 
+
+    Args:
+        sp_tree: A spanning tree of a Tait graph outputted from the tait_graphs function.
+        dual_graph: The dual of the Tait graph of the spanning tree.
     """
     used_crossings = set()
-    for (v_1, v_2, (crossing, small_to_large)) in sp_tree.edges():
+    for (_, _, (crossing, _, _)) in sp_tree.edges():
         used_crossings.add(crossing)
-    dual_tree_edges = [(v_1, v_2, (crossing, small_to_large)) for (v_1, v_2, (crossing, small_to_large)) in dual_graph.edges() if crossing not in used_crossings]
-    return Graph(dual_tree_edges, multiedges = True)
+    dual_tree_edges = [(region1, region2, (crossing, var1, var2)) for (region1, region2, (crossing, var1, var2)) in dual_graph.edges() if crossing not in used_crossings]
+    return Graph(dual_tree_edges, multiedges = True, loops = True)
 
-# Change description of labeling of the regions to be clearer throughout the functions?
-def get_all_sp_tree_terms(L, primal_outward = False, dual_outward = False):
+def all_st_terms(L : Link, primal_outward : bool = False, dual_outward : bool = False) -> dict[LaurentPoly, int]:
+    """Returns the st-terms and their counts obtained from all dual spanning tree pairs of the Tait graphs of a link.
+
+    The t-terms correspond to the regions in the same Tait graph as the region touching the most strands.
+
+    Args:
+        primal_outward: False to count the number of edges pointed into the root in all spanning trees of the primal graph, and True to count the number of edges pointed away.
+        dual_outward: False to count the number of edges pointed into the root in all spanning trees of the dual graph, and True to count the number of edges pointed away.
     """
-    Returns a list of 2-element tuples (s_power, t_power) that can be obtained by some pair of dual spanning trees in the Tait graphs associated to the link L, where s_power is from the dual graph (1-colored regions) and t_power from the primal (0-colored regions) with the region touching the most crossings being 0-colored. In each spanning tree, counts the number of edges pointing towards the root, unless specified otherwise by primal_outward and dual_outward. The output tuples are sorted lexicographically.
-    """
-    sp_tree_tuples = set()
+    # Note that all terms may differ by a monomial under different choice of roots
+    sp_tree_terms = defaultdict(int)
     primal_graph, dual_graph = tait_graphs(L)
-    adj_list = _make_adjacency_list(primal_graph, dual_graph)
-    root_1, root_2 = adjacent_region_column_pairs(L)[0]
-    primal_root, dual_root = ((root_1, root_2) if root_1 in primal_graph.vertices() else (root_2, root_1))
+    root1, root2 = adjacent_region_column_pairs(L)[0]
+    primal_root, dual_root = ((root1, root2) if root1 in primal_graph.vertices() else (root2, root1))
     for sp_tree in primal_graph.spanning_trees(labels = True):
-        t_power = len(_get_oriented_edges(sp_tree, primal_root, adj_list, primal_outward))
-        dual_sp_tree = _get_dual_tree(sp_tree, dual_graph)
-        s_power = len(_get_oriented_edges(dual_sp_tree, dual_root, adj_list, dual_outward))
-        sp_tree_tuples.add((s_power, t_power))
-    return sorted(list(sp_tree_tuples))
-
-def st_poly_from_sp_trees(L, primal_outward = False, dual_outward = False):
-    """
-    Returns the st-polynomial of L using the method of dual spanning trees. In each spanning tree, counts the number of edges pointing towards the root, unless specified otherwise by primal_outward and dual_outward. Powers of s or t that appear in all terms are removed.
-
-    TO BE FIXED: right now, this method gives the same positive sign to all terms due to sign not being accounted for in the helper functions. So the result is NOT the exact st-polynomial.
-    """
-    R = LaurentPolynomialRing(ZZ, ('s', 't'))
-    s, t = R.gens()
-    st_polynomial = 0
-    primal_graph, dual_graph = tait_graphs(L)
-    adj_list = _make_adjacency_list(primal_graph, dual_graph)
-    root_1, root_2 = adjacent_region_column_pairs(L)[0]
-    primal_root, dual_root = ((root_1, root_2) if root_1 in primal_graph.vertices() else (root_2, root_1))
-    for sp_tree in primal_graph.spanning_trees(labels = True):
-        t_power = len(_get_oriented_edges(sp_tree, primal_root, adj_list, primal_outward))
-        dual_sp_tree = _get_dual_tree(sp_tree, dual_graph)
-        s_power = len(_get_oriented_edges(dual_sp_tree, dual_root, adj_list, dual_outward))
-        st_polynomial += s^s_power * t^t_power
-    return normalize_laurent(st_polynomial)
-
-def sp_tree_terms_to_st_poly(sp_tree_tuples):
-    """
-    Returns the st-polynomial one would get from sp_tree_tuples if all terms appearing from some spanning tree had coefficient 1, with powers of s or t that appear in all terms removed. 
-    """
-    R = LaurentPolynomialRing(ZZ, ('s', 't'))
-    s, t = R.gens()
-    st_polynomial = 0
-    for (s_power, t_power) in sp_tree_tuples:
-        st_polynomial += s^s_power * t^t_power
-    return normalize_laurent(st_polynomial)
+        t_term = _st_term(sp_tree, primal_root, primal_outward)
+        dual_tree = _dual_tree(sp_tree, dual_graph)
+        s_term = _st_term(dual_tree, dual_root, dual_outward)
+        sp_tree_terms[t_term * s_term] += 1
+    return sp_tree_terms
